@@ -4,6 +4,8 @@ A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
 
+[▶ Watch the gameplay showcase](https://youtu.be/MAGdv442zkY)
+
 # Notes from the author
 
 I have only focused on the following games that I personally wanted to get running on PS3. Most of these did not work on PSP Remasters.
