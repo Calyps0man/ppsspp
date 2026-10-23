@@ -431,5 +431,5 @@ later (`LICENSE.TXT`). This port is under the same license. It uses the PSL1GHT 
 ps3dev toolchain, FFmpeg (LGPL) for video, and other libraries listed in
 `PS3/cpu-test/THIRD_PARTY.txt`.
 
-This project is not affiliated with Sony or with the PPSSPP project. PlayStation, PS3 and PSP are
+This project is not affiliated with Sony. PlayStation, PS3 and PSP are
 trademarks of Sony Interactive Entertainment. Use your own legally obtained games.
