@@ -15,7 +15,7 @@ There are probably many more games that can run, but I will not be doing more wo
 | Call of Duty Road to Victory | No issues,  2x res, 20-30 FPS |
 | Dead to Rights Retribution | No issues, 2x res, 30 FPS |
 | Def Jam Fight for NY: Takeover | No issues, 2x res, 30 FPS |
-| Killzone | Mostly around 30 FPS but at 2x res. The first cutscene is slightly glitchy at the very beginning. |
+| Killzone | Mostly around 30 FPS but at 1x res. The first cutscene is slightly glitchy at the very beginning. |
 | Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. Lowering resolution does not help much |
 | Silent Hill Origins | No issues, 30 FPS, 2x res, 30 FPS |
 
