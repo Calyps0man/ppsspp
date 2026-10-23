@@ -4,7 +4,7 @@ A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
 
-[![Watch the gameplay showcase](https://img.youtube.com/vi/MAGdv442zkY/hqdefault.jpg)](https://youtu.be/MAGdv442zkY)
+[![Watch the gameplay showcase](https://img.youtube.com/vi/Jf_ADUqxCiI/hqdefault.jpg)](https://youtu.be/Jf_ADUqxCiI)
 
 # Notes from the author
 
