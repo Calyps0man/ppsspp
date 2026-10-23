@@ -19,7 +19,7 @@ There are probably many more games that can run, but I will not be doing more wo
 | Def Jam Fight for NY: Takeover | No issues, 2x res, 30 FPS |
 | Gran Turismo | Quite slow, 10-15 fps |
 | Killzone | Mostly around 30 FPS but at 1x res. The first cutscene is slightly glitchy at the very beginning. |
-| Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. Lowering resolution does not help much |
+| Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. Mirror view is broken. Lowering resolution does not help much |
 | Silent Hill Origins | No issues, 30 FPS, 2x res, 30 FPS |
 
 Every game is different, so most settings can be changed per game (see
