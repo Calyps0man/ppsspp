@@ -6,17 +6,18 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 
 # Notes from the author
 
-The games confirmed working are:
+I have only focused on the following games that I personally wanted to get running on PS3. Most of these did not work on PSP Remasters.
+There are probably many more games that can run, but I will not be doing more work on them. Maybe somebody can continue this project...
 
 | Game | Notes |
 | --- | --- |
-| 3rd Birthday | No issues, 30 FPS. |
-| Silent Hill Origins | No issues, 30 FPS. |
-| Dead to Rights Retribution | No issues, 30 FPS. |
-| Call of Duty Road to Victory | No issues, 20–30 FPS. |
-| Killzone | Mostly around 30 FPS. The first cutscene is slightly glitchy at the very beginning. |
-| Def Jam Fight for NY: Takeover | Confirmed working; no additional notes. |
-| Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. |
+| 3rd Birthday | No issues, 2x res, 30 FPS |
+| Call of Duty Road to Victory | No issues,  2x res, 20-30 FPS |
+| Dead to Rights Retribution | No issues, 2x res, 30 FPS |
+| Def Jam Fight for NY: Takeover | No issues, 2x res, 30 FPS |
+| Killzone | Mostly around 30 FPS but at 2x res. The first cutscene is slightly glitchy at the very beginning. |
+| Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. Lowering resolution does not help much |
+| Silent Hill Origins | No issues, 30 FPS, 2x res, 30 FPS |
 
 Every game is different, so most settings can be changed per game (see
 [Per-game settings](#per-game-settings)).
