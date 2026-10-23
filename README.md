@@ -363,29 +363,6 @@ Notes:
 - `launch.log` (with Debug on) says whether a per-game file was found and what it applied.
 - The folder has a `README.txt` with a short version of this.
 
-## Tips for some games
-
-These are what worked in testing on real hardware; your results may differ.
-
-- **Midnight Club: L.A. Remix**: heavy; around 10-15 fps in races. Best found so far: Sound mixing
-  Emulation thread (`sasdirect=1`), Speed limit off, GE lists Emulation thread,
-  GE timing 400, JIT cache Large (`jitlarge=1`; it fills the normal cache every few minutes of
-  driving, and each time all code compiles again at low fps). Keep buffer layouts, Late depth
-  reads, Lens flare occlusion off and File loading Host can help a little more. Its intro video
-  plays at full speed since build 208. Frameskip makes little difference here: the game draws
-  about 12 new pictures a second with Auto or Off.
-- **Call of Duty: Roads to Victory**: set Right stick to Face buttons (`rstick=1`) for the camera.
-  Don't use the Large JIT cache (`jitlarge=1`): the game ran out of memory with it.
-- **Silent Hill Origins**: playable with the defaults; it uses nearly all of the PS3's memory, so
-  leave the EXPERIMENTAL options (GE lists, Keep buffer layouts, File loading Host, Large JIT
-  cache) off for it. Set PSP fonts to Game's own (`discfonts=1`): with Emulated, letters in its
-  text sit at odd distances ("PA USED"). Don't use Skip keeps menus. Leave Video deblocking on Auto
-  so the menu music doesn't crackle. Keep Debug off: logging makes the menu's background video
-  jerky. Any Frame cap in videos setting works for the menu since build 228. The first loading
-  screen shows only its top part (known bug).
-- **Gran Turismo**: menus may glitch with Frameskip on; Skip keeps menus (`skipkeep=1`) helps.
-- **Dead to Rights: Reckoning**: works with the defaults.
-
 ## Files and folders
 
 Everything is in `/dev_hdd0/game/PPSSPP001/USRDIR/`:
