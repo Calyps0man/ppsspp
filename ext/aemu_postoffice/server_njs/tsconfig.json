@@ -1,0 +1,13 @@
+{
+	"compilerOptions":{
+		"types":[
+			"node"
+		],
+		"module":"node20",
+		"target":"es2025",
+		"noImplicitAny":true
+	},
+	"files":[
+		"aemu_postoffice.ts"
+	]
+}

@@ -1,0 +1,748 @@
+#include <memory>
+#include <string>
+#include <mutex>
+#include <algorithm>
+
+#include "Common/File/VFS/VFS.h"
+#include "Common/UI/Root.h"
+
+#include "Common/Data/Text/I18n.h"
+#include "Common/CommonTypes.h"
+#include "Common/Data/Format/RIFF.h"
+#include "Common/Log.h"
+#include "Common/System/System.h"
+#include "Common/System/OSD.h"
+#include "Common/Serialize/SerializeFuncs.h"
+#include "Common/TimeUtil.h"
+#include "Common/Data/Collections/FixedSizeQueue.h"
+#include "Core/HW/SimpleAudioDec.h"
+#include "Core/HLE/__sceAudio.h"
+#include "Core/System.h"
+#include "Core/Config.h"
+#include "UI/GameInfoCache.h"
+#include "UI/BackgroundAudio.h"
+
+struct WavData {
+	int num_channels = -1;
+	int sample_rate = -1;
+	int numFrames = -1;
+	int samplesPerSec = -1;
+	int avgBytesPerSec = -1;
+	int raw_offset_loop_start = 0;
+	int raw_offset_loop_end = 0;
+	int loop_start_offset = 0;
+	int loop_end_offset = 0;
+	int codec = 0;
+	int raw_bytes_per_frame = 0;
+	uint8_t *raw_data = nullptr;
+	int raw_data_size = 0;
+	u8 at3_extradata[16]{};
+
+	bool Read(RIFFReader &riff);
+
+	~WavData() {
+		free(raw_data);
+		raw_data = nullptr;
+	}
+
+	[[nodiscard]]
+	bool IsSimpleWAV() const {
+		// Sample::Load() only actually handles these two exact cases (16-bit or 8-bit
+		// raw PCM); anything else used to pass this check while leaving Load()'s
+		// output buffer uninitialized (played back as heap garbage) since neither of
+		// its two conversion branches would match.
+		bool validFrameSize = raw_bytes_per_frame == (int)sizeof(int16_t) * num_channels || raw_bytes_per_frame == num_channels;
+		return validFrameSize && num_channels > 0 && sample_rate >= 8000 && codec == 0;
+	}
+};
+
+bool WavData::Read(RIFFReader &file_) {
+	// If we have no loop start info, we'll just loop the entire audio.
+	raw_offset_loop_start = 0;
+	raw_offset_loop_end = 0;
+
+	if (file_.Descend('RIFF')) {
+		file_.ReadInt(); //get past 'WAVE'
+		if (file_.Descend('fmt ')) { //enter the format chunk
+			int temp = file_.ReadInt();
+			int format = temp & 0xFFFF;
+			switch (format) {
+			case 0xFFFE:
+				codec = PSP_CODEC_AT3PLUS;
+				break;
+			case 0x270:
+				codec = PSP_CODEC_AT3;
+				break;
+			case 1:
+				// Raw wave data, no codec
+				codec = 0;
+				break;
+			default:
+				ERROR_LOG(Log::sceAudio, "Unexpected wave format %04x", format);
+				return false;
+			}
+
+			num_channels = temp >> 16;
+
+			samplesPerSec = file_.ReadInt();
+			/*avgBytesPerSec =*/ file_.ReadInt();
+
+			temp = file_.ReadInt();
+			raw_bytes_per_frame = temp & 0xFFFF;
+
+			if (codec == PSP_CODEC_AT3) {
+				// The first two bytes are actually not a useful part of the extradata.
+				// We already read 16 bytes, so make sure there's enough left.
+				if (file_.GetCurrentChunkSize() >= 32) {
+					file_.ReadData(at3_extradata, 16);
+				} else {
+					memset(at3_extradata, 0, sizeof(at3_extradata));
+				}
+			}
+			file_.Ascend();
+			// INFO_LOG(Log::AUDIO, "got fmt data: %i", samplesPerSec);
+		} else {
+			ERROR_LOG(Log::Audio, "Error - no format chunk in wav");
+			file_.Ascend();
+			return false;
+		}
+
+		if (file_.Descend('smpl')) {
+			std::vector<u8> smplData;
+			smplData.resize(file_.GetCurrentChunkSize());
+			if (!smplData.empty()) {
+				file_.ReadData(smplData.data(), (int)smplData.size());
+			}
+
+			// A short/corrupt 'smpl' chunk shouldn't make us read past the buffer.
+			if (smplData.size() >= 32) {
+				int numLoops = *(int *)&smplData[28];
+				struct AtracLoopInfo {
+					int cuePointID;
+					int type;
+					int startSample;
+					int endSample;
+					int fraction;
+					int playCount;
+				};
+
+				if (numLoops > 0 && smplData.size() >= 36 + sizeof(AtracLoopInfo) * numLoops) {
+					AtracLoopInfo *loops = (AtracLoopInfo *)&smplData[36];
+					int samplesPerFrame = codec == PSP_CODEC_AT3PLUS ? 2048 : 1024;
+
+					for (int i = 0; i < numLoops; ++i) {
+						// Only seen forward loops, so let's ignore others.
+						if (loops[i].type != 0)
+							continue;
+
+						// We ignore loop interpolation (fraction) and play count for now.
+						raw_offset_loop_start = (loops[i].startSample / samplesPerFrame) * raw_bytes_per_frame;
+						loop_start_offset = loops[i].startSample % samplesPerFrame;
+						raw_offset_loop_end = (loops[i].endSample / samplesPerFrame) * raw_bytes_per_frame;
+						loop_end_offset = loops[i].endSample % samplesPerFrame;
+
+						if (loops[i].playCount == 0) {
+							// This was an infinite loop, so ignore the rest.
+							// In practice, there's usually only one and it's usually infinite.
+							break;
+						}
+					}
+				}
+			}
+
+			file_.Ascend();
+		}
+
+		// enter the data chunk
+		if (file_.Descend('data')) {
+			// raw_bytes_per_frame (the 'fmt ' chunk's blockAlign field, read above) is
+			// unvalidated file data - a value of 0 would otherwise divide by zero here.
+			if (raw_bytes_per_frame <= 0) {
+				ERROR_LOG(Log::Audio, "Error - bad blockalign");
+				file_.Ascend();
+				return false;
+			}
+
+			int numBytes = file_.GetCurrentChunkSize();
+			numFrames = numBytes / raw_bytes_per_frame;  // numFrames
+
+			// It seems the atrac3 codec likes to read a little bit outside.
+			const int padding = 32;  // 32 is the value FFMPEG uses.
+			raw_data = (uint8_t *)malloc(numBytes + padding);
+			if (!raw_data) {
+				ERROR_LOG(Log::Audio, "Error - failed to allocate %d bytes for wave data", numBytes + padding);
+				file_.Ascend();
+				return false;
+			}
+			raw_data_size = numBytes;
+
+			if (num_channels == 1 || num_channels == 2) {
+				if (!file_.ReadData(raw_data, numBytes)) {
+					ERROR_LOG(Log::Audio, "Error - data chunk truncated");
+					free(raw_data);
+					raw_data = nullptr;
+					return false;
+				}
+			} else {
+				ERROR_LOG(Log::Audio, "Error - bad blockalign or channels");
+				free(raw_data);
+				raw_data = nullptr;
+				return false;
+			}
+			file_.Ascend();
+		} else {
+			ERROR_LOG(Log::Audio, "Error - no data chunk in wav");
+			file_.Ascend();
+			return false;
+		}
+		file_.Ascend();
+	} else {
+		ERROR_LOG(Log::Audio, "Could not descend into RIFF file.");
+		return false;
+	}
+	sample_rate = samplesPerSec;
+	return true;
+}
+
+// Really simple looping in-memory AT3 player that also takes care of reading the file format.
+// Turns out that AT3 files used for this are modified WAVE files so fairly easy to parse.
+class AT3PlusReader {
+public:
+	explicit AT3PlusReader(const std::string &data) : file_((const uint8_t *)&data[0], (int32_t)data.size()) {
+		if (!wave_.Read(file_)) {
+			ERROR_LOG(Log::Audio, "Error - could not read wave data");
+			return;
+		}
+
+		// Normally 8k but let's be safe.
+		buffer_ = new short[32 * 1024];
+		skip_next_samples_ = 0;
+
+		uint8_t *extraData = nullptr;
+		size_t extraDataSize = 0;
+		size_t blockSize = 0;
+		if (wave_.codec == PSP_CODEC_AT3) {
+			extraData = &wave_.at3_extradata[2];
+			extraDataSize = 14;
+			blockSize = wave_.raw_bytes_per_frame;
+		} else if (wave_.codec == PSP_CODEC_AT3PLUS) {
+			blockSize = wave_.raw_bytes_per_frame;
+		}
+		decoder_ = CreateAudioDecoder((PSPAudioType)wave_.codec, wave_.sample_rate, wave_.num_channels, blockSize, extraData, extraDataSize);
+		INFO_LOG(Log::Audio, "read ATRAC, frames: %d, rate %d", wave_.numFrames, wave_.sample_rate);
+	}
+
+	~AT3PlusReader() {
+		delete[] buffer_;
+		buffer_ = nullptr;
+		delete decoder_;
+		decoder_ = nullptr;
+	}
+
+	bool IsOK() const { return wave_.raw_data != nullptr; }
+
+	bool Read(int *buffer, int len) {
+		if (!wave_.raw_data)
+			return false;
+
+		while (bgQueue.size() < (size_t)(len * 2)) {
+			int outSamples = 0;
+			int inbytesConsumed = 0;
+			// raw_bytes_per_frame is unvalidated file data (the 'fmt ' chunk's blockAlign
+			// field) - clamp the length passed to the decoder to what's actually left in
+			// raw_data at raw_offset_, so a bogus blockAlign can't make it read past the
+			// (padded) allocation.
+			const int kPadding = 32;  // Matches WavData::Read's allocation padding.
+			int available = std::max(0, wave_.raw_data_size + kPadding - raw_offset_);
+			int inBytes = std::min(wave_.raw_bytes_per_frame, available);
+			bool result = decoder_->Decode(wave_.raw_data + raw_offset_, inBytes, &inbytesConsumed, 2, (int16_t *)buffer_, &outSamples);
+			if (!result || !outSamples)
+				return false;
+			int outBytes = outSamples * 2 * sizeof(int16_t);
+
+			if (wave_.raw_offset_loop_end != 0 && raw_offset_ == wave_.raw_offset_loop_end) {
+				// Only take the remaining bytes, but convert to stereo s16.
+				outBytes = std::min(outBytes, wave_.loop_end_offset * 4);
+			}
+
+			int start = skip_next_samples_;
+			skip_next_samples_ = 0;
+
+			for (int i = start; i < outBytes / 2; i++) {
+				bgQueue.push(buffer_[i]);
+			}
+
+			if (wave_.raw_offset_loop_end != 0 && raw_offset_ == wave_.raw_offset_loop_end) {
+				// Time to loop.  Account for the addition below.
+				raw_offset_ = wave_.raw_offset_loop_start - wave_.raw_bytes_per_frame;
+				// This time we're counting each stereo sample.
+				skip_next_samples_ = wave_.loop_start_offset * 2;
+			}
+
+			// Handle loops when there's no loop info.
+			raw_offset_ += wave_.raw_bytes_per_frame;
+			if (raw_offset_ >= wave_.raw_data_size) {
+				raw_offset_ = 0;
+			}
+		}
+
+		for (int i = 0; i < len * 2; i++) {
+			buffer[i] = bgQueue.pop_front();
+		}
+		return true;
+	}
+
+private:
+	RIFFReader file_;
+
+	WavData wave_;
+
+	int raw_offset_ = 0;
+	int skip_next_samples_ = 0;
+	FixedSizeQueue<s16, 128 * 1024> bgQueue;
+	short *buffer_ = nullptr;
+	AudioDecoder *decoder_ = nullptr;
+};
+
+BackgroundAudio g_BackgroundAudio;
+
+BackgroundAudio::BackgroundAudio() {
+	buffer_ = new int[BUFSIZE]();
+	sndLoadPending_.store(false);
+}
+
+BackgroundAudio::~BackgroundAudio() {
+	delete at3Reader_;
+	delete[] buffer_;
+}
+
+void BackgroundAudio::Clear(bool hard) {
+	if (!hard) {
+		fadingOut_ = true;
+		volumeFader_ = 1.0f;
+		return;
+	}
+	if (at3Reader_) {
+		delete at3Reader_;
+		at3Reader_ = nullptr;
+	}
+	playbackOffset_ = 0;
+	sndLoadPending_ = false;
+}
+
+void BackgroundAudio::SetGame(const Path &path) {
+	if (path == bgGamePath_) {
+		// Do nothing
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (path.empty()) {
+		Clear(false);
+		sndLoadPending_ = false;
+		fadingOut_ = true;
+	} else {
+		Clear(true);
+		gameLastChanged_ = time_now_d();
+		sndLoadPending_ = true;
+		fadingOut_ = false;
+	}
+	volumeFader_ = 1.0f;
+	bgGamePath_ = path;
+}
+
+bool BackgroundAudio::Play() {
+	std::lock_guard<std::mutex> lock(mutex_);
+
+	// Immediately stop the sound if it is turned off while playing.
+	if (g_Config.iUIVolume <= 0) {
+		Clear(true);
+		System_AudioClear();
+		return true;
+	}
+
+	double now = time_now_d();
+	int sz = 44100 / 60;
+	if (lastPlaybackTime_ > 0.0 && lastPlaybackTime_ <= now) {
+		sz = (int)((now - lastPlaybackTime_) * 44100);
+	}
+
+	sz = std::min(BUFSIZE / 2, sz);
+	if (at3Reader_) {
+		if (at3Reader_->Read(buffer_, sz)) {
+			if (fadingOut_) {
+				float vol = volumeFader_;
+				// TODO: This isn't optimized. But hardly matters...
+				for (int i = 0; i < sz * 2; i += 2) {
+					const float v = vol;
+					buffer_[i] = (int)((float)buffer_[i] * v);
+					buffer_[i + 1] = (int)((float)buffer_[i + 1] * v);
+					vol += delta_;
+				}
+				volumeFader_ = vol;
+			}
+		}
+	} else {
+		for (int i = 0; i < sz * 2; i += 2) {
+			buffer_[i] = 0;
+			buffer_[i + 1] = 0;
+		}
+	}
+
+	float multiplier = Volume100ToMultiplier(g_Config.iGamePreviewVolume);
+	System_AudioPushSamples(buffer_, sz, multiplier);
+
+	if (at3Reader_ && fadingOut_ && volumeFader_ <= 0.0f) {
+		Clear(true);
+		fadingOut_ = false;
+		gameLastChanged_ = 0;
+	}
+
+	lastPlaybackTime_ = now;
+
+	return true;
+}
+
+void BackgroundAudio::Update() {
+	// If there's a game, and some time has passed since the selected game
+	// last changed... (to prevent crazy amount of reads when skipping through a list)
+	if (sndLoadPending_ && (time_now_d() - gameLastChanged_ > 0.5)) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		// Already loaded somehow?  Or no game info cache?
+		if (at3Reader_ || !g_gameInfoCache)
+			return;
+
+		// Grab some audio from the current game and play it.
+		std::shared_ptr<GameInfo> gameInfo = g_gameInfoCache->GetInfo(nullptr, bgGamePath_, GameInfoFlags::SND);
+		if (!gameInfo->Ready(GameInfoFlags::SND)) {
+			// Should try again shortly..
+			return;
+		}
+
+		const std::string &data = gameInfo->sndFileData;
+		if (!data.empty()) {
+			at3Reader_ = new AT3PlusReader(data);
+			lastPlaybackTime_ = 0.0;
+		}
+		sndLoadPending_ = false;
+	}
+}
+
+inline int16_t ConvertU8ToI16(uint8_t value) {
+	int ivalue = value - 128;
+	return ivalue * 255;
+}
+
+// Returns the size of the MPEG-1/2/2.5 Layer III frame whose header is at p, or 0 if it isn't one.
+static int Mp3FrameSize(const uint8_t *p, int *sampleRate) {
+	if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0 || (p[1] & 0x06) != 0x02) {
+		return 0;
+	}
+	static const int bitratesV1[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+	static const int bitratesV2[16] = { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 };
+	static const int sampleRatesV1[4] = { 44100, 48000, 32000, 0 };
+	const int version = (p[1] >> 3) & 3;  // 3 = MPEG-1, 2 = MPEG-2, 0 = MPEG-2.5.
+	if (version == 1) {
+		return 0;
+	}
+	const int bitrate = (version == 3 ? bitratesV1 : bitratesV2)[p[2] >> 4] * 1000;
+	int rate = sampleRatesV1[(p[2] >> 2) & 3];
+	if (!bitrate || !rate) {
+		return 0;
+	}
+	rate >>= (version == 3 ? 0 : (version == 2 ? 1 : 2));
+	*sampleRate = rate;
+	const int padding = (p[2] >> 1) & 1;
+	return (version == 3 ? 144 : 72) * bitrate / rate + padding;
+}
+
+// Checks for a Xing/Info frame, which some encoders put first. If it carries a LAME tag,
+// also returns the samples to trim from the start and end of the decoded stream.
+static bool ParseXingFrame(const uint8_t *p, int frameSize, int *delay, int *padding) {
+	const int version = (p[1] >> 3) & 3;
+	const bool mono = (p[3] >> 6) == 3;
+	const int sideInfoSize = version == 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+	const int tagPos = 4 + sideInfoSize;
+	if (tagPos + 8 > frameSize || (memcmp(p + tagPos, "Xing", 4) && memcmp(p + tagPos, "Info", 4))) {
+		return false;
+	}
+	const uint8_t flags = p[tagPos + 7];
+	// Skip the optional frame count, byte count, seek table and quality fields.
+	static const int fieldSizes[4] = { 4, 4, 100, 4 };
+	int lamePos = tagPos + 8;
+	for (int i = 0; i < 4; i++) {
+		if (flags & (1 << i)) {
+			lamePos += fieldSizes[i];
+		}
+	}
+	if (lamePos + 24 <= frameSize && (!memcmp(p + lamePos, "LAME", 4) || !memcmp(p + lamePos, "Lav", 3))) {
+		const uint8_t *t = p + lamePos + 21;
+		// The decoder adds 529 samples of its own delay (and so drops them from the padding).
+		const int decoderDelay = 529;
+		*delay = ((t[0] << 4) | (t[1] >> 4)) + decoderDelay;
+		*padding = std::max(0, (((t[1] & 0xF) << 8) | t[2]) - decoderDelay);
+	}
+	return true;
+}
+
+static Sample *LoadMp3(const uint8_t *data, size_t size) {
+	size_t pos = 0;
+	// Skip an ID3v2 tag.
+	if (size >= 10 && !memcmp(data, "ID3", 3)) {
+		pos = 10 + (((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F));
+		if (data[5] & 0x10) {
+			pos += 10;  // Footer.
+		}
+	}
+
+	std::unique_ptr<AudioDecoder> decoder;
+	std::vector<int16_t> samples;
+	int16_t frameBuf[1152 * 2];
+	int sampleRate = 0;
+	int delay = 0;
+	int padding = 0;
+	while (pos + 4 <= size) {
+		int frameRate = 0;
+		int frameSize = Mp3FrameSize(data + pos, &frameRate);
+		if (frameSize == 0 || pos + frameSize > size) {
+			// Resync, byte by byte.
+			pos++;
+			continue;
+		}
+		if (!decoder) {
+			sampleRate = frameRate;
+			decoder.reset(CreateAudioDecoder(PSP_CODEC_MP3, sampleRate, 2));
+			if (ParseXingFrame(data + pos, frameSize, &delay, &padding)) {
+				// It decodes to silence.
+				pos += frameSize;
+				continue;
+			}
+		}
+		int consumed = 0;
+		int outSamples = 0;
+		if (frameRate == sampleRate && decoder->Decode(data + pos, frameSize, &consumed, 2, frameBuf, &outSamples)) {
+			samples.insert(samples.end(), frameBuf, frameBuf + outSamples * 2);
+		}
+		pos += frameSize;
+	}
+
+	// Trim the encoder delay and padding, in stereo frames.
+	const size_t trim = (size_t)(delay + padding) * 2;
+	if (samples.size() > trim) {
+		samples.erase(samples.end() - padding * 2, samples.end());
+		samples.erase(samples.begin(), samples.begin() + delay * 2);
+	}
+
+	if (samples.empty()) {
+		return nullptr;
+	}
+	int16_t *sampleData = new int16_t[samples.size()];
+	memcpy(sampleData, samples.data(), samples.size() * sizeof(int16_t));
+	return new Sample(sampleData, 2, (int)samples.size() / 2, sampleRate);
+}
+
+Sample *Sample::Load(const std::string &path) {
+	size_t data_size = 0;
+	uint8_t *data = g_VFS.ReadFile(path.c_str(), &data_size);
+	if (!data || data_size > 100000000) {
+		WARN_LOG(Log::Audio, "Failed to load sample '%s'", path.c_str());
+		return nullptr;
+	}
+
+	const char *wav_magic = "RIFF";
+	if (!memcmp(data, wav_magic, 4)) {
+		RIFFReader reader(data, (int)data_size);
+		WavData wave;
+		if (!wave.Read(reader)) {
+			delete[] data;
+			return nullptr;
+		}
+		// A wav file.
+		delete[] data;
+
+		if (!wave.IsSimpleWAV()) {
+			ERROR_LOG(Log::Audio, "Wave format not supported for mixer playback. Must be 8-bit or 16-bit raw mono or stereo. '%s'", path.c_str());
+			return nullptr;
+		}
+
+		int16_t *samples = new int16_t[wave.num_channels * wave.numFrames];
+		if (wave.raw_bytes_per_frame == wave.num_channels * 2) {
+			// 16-bit
+			memcpy(samples, wave.raw_data, wave.numFrames * wave.raw_bytes_per_frame);
+		} else if (wave.raw_bytes_per_frame == wave.num_channels) {
+			// 8-bit. Convert.
+			for (int i = 0; i < wave.num_channels * wave.numFrames; i++) {
+				samples[i] = ConvertU8ToI16(wave.raw_data[i]);
+			}
+		}
+
+		// Protect against bad metadata.
+		int actualFrames = std::min(wave.numFrames, wave.raw_data_size / wave.raw_bytes_per_frame);
+
+		return new Sample(samples, wave.num_channels, actualFrames, wave.sample_rate);
+	}
+
+	// Something else, try MP3.
+	Sample *sample = LoadMp3(data, data_size);
+	delete[] data;
+	if (!sample) {
+		ERROR_LOG(Log::Audio, "Couldn't load MP3 for sound effect from %s", path.c_str());
+	}
+	return sample;
+}
+
+static inline int16_t Clamp16(int32_t sample) {
+	if (sample < -32767) return -32767;
+	if (sample > 32767) return 32767;
+	return sample;
+}
+
+void SoundEffectMixer::Mix(int16_t *buffer, int sz, int sampleRateHz) {
+	{
+		std::lock_guard<std::mutex> guard(mutex_);
+		if (!queue_.empty()) {
+			for (const auto &entry : queue_) {
+				plays_.push_back(entry);
+			}
+			queue_.clear();
+		}
+		if (plays_.empty()) {
+			return;
+		}
+	}
+
+	for (std::vector<PlayInstance>::iterator iter = plays_.begin(); iter != plays_.end(); ) {
+		auto sample = samples_[(int)iter->sound].get();
+		if (!sample) {
+			// Remove playback instance if sample invalid.
+			iter = plays_.erase(iter);
+			continue;
+		}
+
+		int64_t rateOfSample = sample->rateInHz_;
+		int64_t stride = (rateOfSample << 32) / sampleRateHz;
+
+		for (int i = 0; i < sz * 2; i += 2) {
+			if ((iter->offset >> 32) >= sample->length_ - 2) {
+				iter->done = true;
+				break;
+			}
+
+			int wholeOffset = iter->offset >> 32;
+			int frac = (iter->offset >> 20) & 0xFFF;  // Use a 12 bit fraction to get away with 32-bit multiplies
+
+			if (sample->channels_ == 2) {
+				int interpolatedLeft = (sample->data_[wholeOffset * 2] * (0x1000 - frac) + sample->data_[(wholeOffset + 1) * 2] * frac) >> 12;
+				int interpolatedRight = (sample->data_[wholeOffset * 2 + 1] * (0x1000 - frac) + sample->data_[(wholeOffset + 1) * 2 + 1] * frac) >> 12;
+
+				// Clamping add on top per sample. Not great, we should be mixing at higher bitrate instead. Oh well.
+				int left = Clamp16(buffer[i] + (interpolatedLeft * iter->volume >> 8));
+				int right = Clamp16(buffer[i + 1] + (interpolatedRight * iter->volume >> 8));
+
+				buffer[i] = left;
+				buffer[i + 1] = right;
+			} else if (sample->channels_ == 1) {
+				int interpolated = (sample->data_[wholeOffset] * (0x1000 - frac) + sample->data_[wholeOffset + 1] * frac) >> 12;
+
+				// Clamping add on top per sample. Not great, we should be mixing at higher bitrate instead. Oh well.
+				int value = Clamp16(buffer[i] + (interpolated * iter->volume >> 8));
+
+				buffer[i] = value;
+				buffer[i + 1] = value;
+			}
+
+			iter->offset += stride;
+		}
+
+		if (iter->done) {
+			iter = plays_.erase(iter);
+		} else {
+			iter++;
+		}
+	}
+}
+
+void SoundEffectMixer::Play(UI::UISound sfx, float multiplier) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	queue_.push_back(PlayInstance{ sfx, 0, (int)(255.0f * multiplier), false });
+}
+
+void SoundEffectMixer::UpdateSample(UI::UISound sound, Sample *sample) {
+	if (sample) {
+		std::lock_guard<std::mutex> guard(mutex_);
+		samples_[(size_t)sound] = std::unique_ptr<Sample>(sample);
+	} else {
+		LoadDefaultSample(sound);
+	}
+}
+
+void SoundEffectMixer::LoadDefaultSample(UI::UISound sound) {
+	const char *filename = nullptr;
+
+	switch (sound) {
+	case UI::UISound::BACK: filename = "sfx_back.wav"; break;
+	case UI::UISound::SELECT: filename = "sfx_select.wav"; break;
+	case UI::UISound::CONFIRM: filename = "sfx_confirm.wav"; break;
+	case UI::UISound::TOGGLE_ON: filename = "sfx_toggle_on.wav"; break;
+	case UI::UISound::TOGGLE_OFF: filename = "sfx_toggle_off.wav"; break;
+	case UI::UISound::ACHIEVEMENT_UNLOCKED: filename = "sfx_achievement_unlocked.wav"; break;
+	case UI::UISound::LEADERBOARD_SUBMITTED: filename = "sfx_leaderbord_submitted.wav"; break;
+	default:
+		return;
+	}
+
+	Sample *sample = Sample::Load(filename);
+	if (!sample) {
+		ERROR_LOG(Log::Audio, "Failed to load the default sample for UI sound %d", (int)sound);
+	}
+	std::lock_guard<std::mutex> guard(mutex_);
+	samples_[(size_t)sound] = std::unique_ptr<Sample>(sample);
+}
+
+class SampleLoadTask : public Task {
+public:
+	SampleLoadTask(SoundEffectMixer *mixer) : mixer_(mixer) {}
+	TaskType Type() const override { return TaskType::IO_BLOCKING; }
+	TaskPriority Priority() const override {
+		return TaskPriority::NORMAL;
+	}
+	void Run() override {
+		mixer_->LoadSamplesOnThread();
+	}
+private:
+	SoundEffectMixer *mixer_;
+};
+
+void SoundEffectMixer::Init() {
+	samples_.resize((size_t)UI::UISound::COUNT);
+
+	// Setup UI sound callback. For navigation sounds only.
+	UI::SetSoundCallback([](UI::UISound sound) {
+		if (g_Config.bUISound) {
+			float volume = Volume100ToMultiplier(g_Config.iUIVolume);
+			g_BackgroundAudio.SFX().Play(sound, volume);
+		}
+	});
+
+	// Load samples in the background.
+	g_threadManager.EnqueueTask(new SampleLoadTask(this));
+}
+
+void SoundEffectMixer::LoadSamplesOnThread() {
+	LoadDefaultSample(UI::UISound::BACK);
+	LoadDefaultSample(UI::UISound::SELECT);
+	LoadDefaultSample(UI::UISound::CONFIRM);
+	LoadDefaultSample(UI::UISound::TOGGLE_ON);
+	LoadDefaultSample(UI::UISound::TOGGLE_OFF);
+
+	if (!g_Config.sAchievementsUnlockAudioFile.empty()) {
+		UpdateSample(UI::UISound::ACHIEVEMENT_UNLOCKED, Sample::Load(g_Config.sAchievementsUnlockAudioFile));
+	} else {
+		LoadDefaultSample(UI::UISound::ACHIEVEMENT_UNLOCKED);
+	}
+	if (!g_Config.sAchievementsLeaderboardSubmitAudioFile.empty()) {
+		UpdateSample(UI::UISound::LEADERBOARD_SUBMITTED, Sample::Load(g_Config.sAchievementsLeaderboardSubmitAudioFile));
+	} else {
+		LoadDefaultSample(UI::UISound::LEADERBOARD_SUBMITTED);
+	}
+}

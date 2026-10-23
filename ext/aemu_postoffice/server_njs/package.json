@@ -1,0 +1,12 @@
+{
+	"name":"aemu_postoffice",
+	"license":"GPL-3.0-only",
+	"dependencies":{
+		"typescript":"6.0.2",
+		"@types/node":"25.5.0"
+	},
+	"scripts":{
+		"build":"tsc",
+		"start":"node aemu_postoffice.js"
+	}
+}

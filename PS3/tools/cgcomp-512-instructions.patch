@@ -1,0 +1,11 @@
+--- a/tools/cgcomp/include/parser.h
++++ b/tools/cgcomp/include/parser.h
+@@ -13,7 +13,7 @@
+ 
+ /** For GL_NV_vertex_program */
+ /*@{*/
+-#define MAX_NV_VERTEX_PROGRAM_INSTRUCTIONS 256
++#define MAX_NV_VERTEX_PROGRAM_INSTRUCTIONS 512
+ #define MAX_NV_VERTEX_PROGRAM_TEMPS         16
+ #define MAX_NV_VERTEX_PROGRAM_PARAMS        96
+ #define MAX_NV_VERTEX_PROGRAM_INPUTS        16

@@ -1,0 +1,8 @@
+*.o
+*.so
+*.out
+*.elf
+*.prx
+*.log
+*.exe
+*.dll

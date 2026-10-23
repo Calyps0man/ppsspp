@@ -1,0 +1,12 @@
+{
+	"connection_strict_mode":false,
+	"forwarding_strict_mode":false,
+	"max_per_second_data_rate_byte":0,
+	"max_tx_op_rate":0,
+	"accounting_interval_ms":30000,
+	"max_write_buffer_byte":512000,
+	"max_connections":5000,
+	"num_worker_threads":1,
+	"tick_rate_hz":90,
+	"max_ips":0
+}

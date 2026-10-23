@@ -1,0 +1,47 @@
+name: Build package
+
+on: [ push, pull_request, workflow_dispatch ]
+
+jobs:
+  build_pkg:
+    runs-on: ubuntu-24.04
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Install podman
+      run: |
+        sudo apt install podman
+
+    - name: Set env vars
+      run: |
+        echo "sha_name=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_ENV
+        echo "PSPDEV=${GITHUB_WORKSPACE}/pspdev" >> $GITHUB_ENV
+        echo "${GITHUB_WORKSPACE}/pspdev/bin" >> $GITHUB_PATH
+
+    - name: Build
+      run: |
+        cd client
+        bash build_podman.sh
+        cd ../server_njs
+        bash build_podman.sh
+        cd ../server_cpp
+        bash build_podman.sh
+
+    - name: Push package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: aemu_postoffice_${{ env.sha_name }}
+        path: |
+           server_njs/aemu_postoffice.js
+           server_njs/run_podman.sh
+           server_njs/config.json
+           server_njs/sample_game_list_sync_request.json
+           client/postoffice_client_import.S
+           client/aemu_postoffice.prx
+           client/postoffice_client.h
+           client/libaemu_postoffice_client.so
+           client/libaemu_postoffice_client.dll
+           server_cpp/aemu_postoffice
+        if-no-files-found: error

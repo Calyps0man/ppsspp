@@ -1,0 +1,1059 @@
+// Copyright (c) 2022- PPSSPP Project.
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 2.0 or later versions.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License 2.0 for more details.
+
+// A copy of the GPL 2.0 should have been included with the program.
+// If not, see http://www.gnu.org/licenses/
+
+// Official git repository and contact information can be found at
+// https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
+#include "Common/Profiler/Profiler.h"
+#include "Common/Thread/ThreadManager.h"
+#include "Common/Data/Text/StringWriter.h"
+#include "Common/TimeUtil.h"
+#include "Core/System.h"
+#include "GPU/Common/TextureDecoder.h"
+#include "GPU/Software/BinManager.h"
+#include "GPU/Software/HardwareBackend.h"
+#include "GPU/Software/Rasterizer.h"
+#include "GPU/Software/RasterizerRectangle.h"
+
+// Sometimes useful for debugging.
+static constexpr bool FORCE_SINGLE_THREAD = false;
+
+using namespace Rasterizer;
+
+struct BinWaitable : public Waitable {
+public:
+	BinWaitable() {
+		count_ = 0;
+	}
+
+	void Fill() {
+		count_++;
+	}
+
+	bool Empty() {
+		return count_ == 0;
+	}
+
+	void Drain() {
+		int result = --count_;
+		if (result == 0) {
+			// We were the last one to increment.
+			std::unique_lock<std::mutex> lock(mutex_);
+			cond_.notify_all();
+		}
+	}
+
+	void Wait() override {
+		std::unique_lock<std::mutex> lock(mutex_);
+		while (count_ != 0) {
+			cond_.wait(lock);
+		}
+	}
+
+	std::atomic<int> count_;
+	std::mutex mutex_;
+	std::condition_variable cond_;
+};
+
+static inline void DrawBinItem(const BinItem &item, const RasterizerState &state) {
+	switch (item.type) {
+	case BinItemType::TRIANGLE:
+		DrawTriangle(item.v0, item.v1, item.v2, item.range, state);
+		break;
+
+	case BinItemType::CLEAR_RECT:
+		ClearRectangle(item.v0, item.v1, item.range, state);
+		break;
+
+	case BinItemType::RECT:
+		DrawRectangle(item.v0, item.v1, item.range, state);
+		break;
+
+	case BinItemType::SPRITE:
+		DrawSprite(item.v0, item.v1, item.range, state);
+		break;
+
+	case BinItemType::LINE:
+		DrawLine(item.v0, item.v1, item.range, state);
+		break;
+
+	case BinItemType::POINT:
+		DrawPoint(item.v0, item.range, state);
+		break;
+	}
+}
+
+class DrawBinItemsTask : public Task {
+public:
+	DrawBinItemsTask(BinWaitable *notify, BinManager::BinItemQueue &items, std::atomic<bool> &status, const BinManager::BinStateQueue &states)
+		: notify_(notify), items_(items), status_(status), states_(states) {
+	}
+
+	TaskType Type() const override {
+		return TaskType::CPU_COMPUTE;
+	}
+
+	TaskPriority Priority() const override {
+		// Let priority emulation tasks win over this.
+		return TaskPriority::NORMAL;
+	}
+
+	void Run() override {
+		ProcessItems();
+		status_ = false;
+		// In case of any atomic issues, do another pass.
+		ProcessItems();
+		notify_->Drain();
+	}
+
+	void Release() override {
+		// Don't delete, this is statically allocated.
+	}
+
+private:
+	void ProcessItems() {
+		while (!items_.Empty()) {
+			const BinItem &item = items_.PeekNext();
+			DrawBinItem(item, states_[item.stateIndex]);
+			items_.SkipNext();
+		}
+	}
+
+	BinWaitable *notify_;
+	BinManager::BinItemQueue &items_;
+	std::atomic<bool> &status_;
+	const BinManager::BinStateQueue &states_;
+};
+
+constexpr int BinManager::MAX_POSSIBLE_TASKS;
+
+namespace Rasterizer {
+HardwareBackend *g_hardwareBackend = nullptr;
+FlushRange g_flushRange;
+
+static struct {
+	uint32_t start[16], end[16];
+	int count = 0;
+	bool all = false;  // More than fit: everything counts as pending.
+} g_asyncRam;
+
+void NoteAsyncRamWrite(uint32_t start, uint32_t size) {
+	start &= 0x3FFFFFFF;
+	for (int i = 0; i < g_asyncRam.count; ++i) {
+		if (g_asyncRam.start[i] == start) {
+			g_asyncRam.end[i] = std::max(g_asyncRam.end[i], start + size);
+			return;
+		}
+	}
+	if (g_asyncRam.count == 16) {
+		g_asyncRam.all = true;
+		return;
+	}
+	g_asyncRam.start[g_asyncRam.count] = start;
+	g_asyncRam.end[g_asyncRam.count] = start + size;
+	g_asyncRam.count++;
+}
+
+bool AsyncRamWritePending(uint32_t start, uint32_t size) {
+	if (g_asyncRam.all)
+		return true;
+	start &= 0x3FFFFFFF;
+	for (int i = 0; i < g_asyncRam.count; ++i) {
+		if (start < g_asyncRam.end[i] && start + size > g_asyncRam.start[i])
+			return true;
+	}
+	return false;
+}
+
+bool AsyncRamWritesQueued() {
+	return g_asyncRam.all || g_asyncRam.count != 0;
+}
+
+void ClearAsyncRamWrites() {
+	g_asyncRam.count = 0;
+	g_asyncRam.all = false;
+}
+uint32_t g_geCpuEpoch = 1;
+bool g_geEpochSeen = true;
+bool g_tlMergeEnabled = true;
+uint32_t g_geStateSerial = 1;
+int g_lastSerialCmd = -1;
+GeDirtyRange g_geDirty[256];
+uint32_t g_drawSerial = 0;
+const GEState *g_drawStateOverride = nullptr;
+}
+
+BinManager::BinManager() {
+	queueRange_.x1 = 0x7FFFFFFF;
+	queueRange_.y1 = 0x7FFFFFFF;
+	queueRange_.x2 = 0;
+	queueRange_.y2 = 0;
+
+	waitable_ = new BinWaitable();
+	for (auto &s : taskStatus_)
+		s = false;
+
+	int maxInitTasks = std::min(g_threadManager.GetNumLooperThreads(), MAX_POSSIBLE_TASKS);
+	for (int i = 0; i < maxInitTasks; ++i) {
+		taskQueues_[i].Setup();
+		for (DrawBinItemsTask *&task : taskLists_[i].tasks)
+			task = new DrawBinItemsTask(waitable_, taskQueues_[i], taskStatus_[i], states_);
+	}
+	states_.Setup();
+	cluts_.Setup();
+	queue_.Setup();
+}
+
+BinManager::~BinManager() {
+	delete waitable_;
+
+	for (int i = 0; i < MAX_POSSIBLE_TASKS; ++i) {
+		for (DrawBinItemsTask *task : taskLists_[i].tasks)
+			delete task;
+	}
+}
+
+void BinManager::UpdateState() {
+	PROFILE_THIS_SCOPE("bin_state");
+	Rasterizer::g_drawSerial++;
+	auto jitGen = []() {
+		return Rasterizer::JitClearGeneration() + Sampler::JitClearGeneration();
+	};
+	// A JIT clear frees the code the current state's function pointers point into.
+	if (jitGen_ != jitGen()) {
+		dirty_ |= SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL;
+	}
+	// Only the LOD mode/bias changed: patched below, unless the state was already optimized for
+	// its draws (then its sampler and functions aren't the plain ones any more).
+	if (HasDirty(SoftDirty::RAST_TEXLEVEL) && !HasDirty(SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL) &&
+		(states_[stateIndex_].flags & RasterizerStateFlags::OPTIMIZED))
+		dirty_ |= SoftDirty::RAST_TEX;
+	if (HasDirty(SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL)) {
+		if (states_.Full())
+			Flush("states");
+		creatingState_ = true;
+		stateIndex_ = (uint16_t)states_.Push(RasterizerState());
+		// When new funcs are compiled, we need to flush if WX exclusive. Compiling can also clear the caches,
+		// losing the funcs picked before it, so then compute it again.
+		for (int tries = 0; tries < 3; ++tries) {
+			jitGen_ = jitGen();
+			ComputeRasterizerState(&states_[stateIndex_], this);
+			if (jitGen_ == jitGen()) {
+				break;
+			}
+		}
+		states_[stateIndex_].samplerID.cached.clut = cluts_[clutIndex_].readable;
+		creatingState_ = false;
+
+		ClearDirty(SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL | SoftDirty::RAST_TEXLEVEL);
+	} else if (HasDirty(SoftDirty::RAST_TEXLEVEL)) {
+		const RasterizerState &cur = states_[stateIndex_];
+		const uint8_t mode = (uint8_t)gstate.getTexLevelMode();
+		const int8_t offset = (int8_t)gstate.getTexLevelOffset16();
+		if (cur.enableTextures && (cur.texLevelMode != mode || cur.texLevelOffset != offset)) {
+			// A new one: queued draws may still use the current one.
+			alignas(16) RasterizerState next;
+			memcpy((void *)&next, (const void *)&cur, sizeof(next));
+			next.texLevelMode = mode;
+			next.texLevelOffset = offset;
+			// What the draws so far found (CalculateRasterStateFlags) is for them only.
+			next.flags = RasterizerStateFlags::NONE;
+			next.lastFlags = RasterizerStateFlags::INVALID;
+			if (states_.Full())
+				Flush("states");
+			stateIndex_ = (uint16_t)states_.Push(next);
+#if !PPSSPP_PLATFORM(PS3)
+			// PPSSPP_PATCHCHECK: compare with the state computed again.
+			static const bool check = getenv("PPSSPP_PATCHCHECK") != nullptr;
+			if (check) {
+				alignas(16) RasterizerState fresh{};
+				fresh.texFlushGen = next.texFlushGen;
+				fresh.cpuEpoch = next.cpuEpoch;
+				fresh.selfTexture = next.selfTexture;
+				ComputeRasterizerState(&fresh, this);
+				fresh.samplerID.cached.clut = cluts_[clutIndex_].readable;
+				const uint8_t *a = (const uint8_t *)&fresh, *b = (const uint8_t *)&next;
+				static int bad, total;
+				total++;
+				for (size_t i = 0; i < sizeof(fresh); ++i) {
+					if (a[i] != b[i]) {
+						if (bad++ < 20)
+							fprintf(stderr, "PATCHCHECK: byte %d differs (%02x vs patched %02x); sampler at %d, funcs at %d; texmode %08x texfilter %08x tex %08x; levels %d/%d mips %d/%d\n", (int)i, a[i], b[i], (int)offsetof(RasterizerState, samplerID), (int)offsetof(RasterizerState, drawPixel),
+								gstate.texmode, gstate.texfilter, gstate.texaddr[0], fresh.maxTexLevel, next.maxTexLevel, fresh.samplerID.hasAnyMips, next.samplerID.hasAnyMips);
+						break;
+					}
+				}
+				if ((total & 1023) == 0)
+					fprintf(stderr, "PATCHCHECK: %d of %d differ\n", bad, total);
+			}
+#endif
+		}
+		ClearDirty(SoftDirty::RAST_TEXLEVEL);
+	}
+
+	if (lastFlipstats_ != gpuStats.totals.numFlips) {
+		lastFlipstats_ = gpuStats.totals.numFlips;
+		ResetStats();
+	}
+
+	const auto &state = State();
+	const bool hadDepth = pendingWrites_[1].base != 0;
+
+	if (HasDirty(SoftDirty::BINNER_RANGE)) {
+		drawTargetAddr_ = gstate.getFrameBufAddress();
+		DrawingCoords scissorTL(gstate.getScissorX1(), gstate.getScissorY1());
+		DrawingCoords scissorBR(std::min(gstate.getScissorX2(), gstate.getRegionX2()), std::min(gstate.getScissorY2(), gstate.getRegionY2()));
+		ScreenCoords screenScissorTL = TransformUnit::DrawingToScreen(scissorTL, 0);
+		ScreenCoords screenScissorBR = TransformUnit::DrawingToScreen(scissorBR, 0);
+
+		scissor_.x1 = screenScissorTL.x;
+		scissor_.y1 = screenScissorTL.y;
+		scissor_.x2 = screenScissorBR.x + SCREEN_SCALE_FACTOR - 1;
+		scissor_.y2 = screenScissorBR.y + SCREEN_SCALE_FACTOR - 1;
+
+		// Pixels past the stride land in the next row, which another task may be drawing (Tokimeki
+		// Memorial's 128 wide blur buffer under a full screen scissor).
+		const bool pastStride = scissorBR.x >= gstate.FrameBufStride();
+		if (pastStride != pastStride_) {
+			pastStride_ = pastStride;
+			dirty_ |= SoftDirty::BINNER_OVERLAP;
+		}
+
+		// With a hardware backend nothing is queued here: it tracks its own reads of what it drew
+		// (these flushes, every draw in Gran Turismo, only cut its batches).
+		if (!Rasterizer::g_hardwareBackend) {
+			// If we're about to texture from something still pending (i.e. depth), flush.
+			if (HasTextureWrite(state))
+				Flush("tex");
+
+			// Okay, now update what's pending.
+			MarkPendingWrites(state);
+		}
+
+		ClearDirty(SoftDirty::BINNER_RANGE);
+	} else if (pendingOverlap_ && !Rasterizer::g_hardwareBackend) {
+		if (HasTextureWrite(state)) {
+			Flush("tex");
+
+			// We need the pending writes set, which flushing cleared.  Set them again.
+			MarkPendingWrites(state);
+		}
+	}
+
+	if (HasDirty(SoftDirty::BINNER_OVERLAP) && Rasterizer::g_hardwareBackend) {
+		ClearDirty(SoftDirty::BINNER_OVERLAP);
+	} else if (HasDirty(SoftDirty::BINNER_OVERLAP)) {
+		// This is a good place to record any dependencies for block transfer overlap.
+		MarkPendingReads(state);
+
+		// Disallow threads when rendering to the target, even offset.
+		bool selfRender = HasTextureWrite(state);
+		int newMaxTasks = selfRender || pastStride_ || FORCE_SINGLE_THREAD ? 1 : g_threadManager.GetNumLooperThreads();
+		if (newMaxTasks > MAX_POSSIBLE_TASKS)
+			newMaxTasks = MAX_POSSIBLE_TASKS;
+		// We don't want to overlap wrong, so flush any pending.
+		bool flushed = false;
+		if (maxTasks_ != newMaxTasks) {
+			maxTasks_ = newMaxTasks;
+			Flush("selfrender");
+			flushed = true;
+		}
+
+		// Lastly, we have to check if we're newly writing depth we were texturing before.
+		// This happens in Call of Duty (depth clear after depth texture), for example.
+		if (!flushed && !hadDepth && state.pixelID.depthWrite) {
+			for (size_t i = 0; i < states_.Size(); ++i) {
+				if (HasTextureWrite(states_.Peek(i))) {
+					Flush("selfdepth");
+					flushed = true;
+					break;
+				}
+			}
+		}
+
+		if (flushed) {
+			// The flush forgot what this draw writes and reads, so record it again.
+			MarkPendingWrites(state);
+			MarkPendingReads(state);
+			ClearDirty(SoftDirty::BINNER_RANGE);
+		}
+		pendingOverlap_ = pendingOverlap_ || selfRender;
+		selfRender_ = selfRender;
+		ClearDirty(SoftDirty::BINNER_OVERLAP);
+	}
+	states_[stateIndex_].selfTexture = selfRender_;
+	states_[stateIndex_].texFlushGen = texFlushGen_;
+	states_[stateIndex_].cpuEpoch = Rasterizer::g_geCpuEpoch;
+	Rasterizer::g_geEpochSeen = true;
+}
+
+// The GE samples through its texture cache, so a primitive that textures from the buffer it draws to
+// mostly sees that buffer as it was before the primitive (exp81, exp159, exp160). The cache actually
+// fills 8-row blocks as the primitive first reads them, so rows drawn before then show through; this
+// doesn't model that. A texture that fits in the 8 KB cache stays there until TEXFLUSH, so later
+// primitives and draws see it as it was when first read (FF Type-0's 16x16 4444 blur, three passes over
+// one buffer without a flush).
+const RasterizerState &BinManager::SelfTextureSnapshot(const BinItem &item, const RasterizerState &state) {
+	constexpr uint32_t mirrorMask = 0x041FFFFF;
+	const uint32_t bits = textureBitsPerPixel[state.samplerID.texfmt];
+	const uint32_t fbBpp = state.pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+	const uint32_t fbStrideBytes = state.pixelID.cached.framebufStride * fbBpp;
+
+	selfTexState_ = state;
+	uint32_t totalBytes = 0;
+	bool sameTexture = true;
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const uint32_t bytes = state.samplerID.cached.sizes[i].w * bits / 8 * state.samplerID.cached.sizes[i].h;
+		totalBytes += bytes;
+		sameTexture = sameTexture && selfTexAddr_[i] == state.texaddr[i] && selfTexBuf_[i].size() == state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+	}
+	const bool cacheSized = totalBytes <= 8192;
+	if (cacheSized && selfTexCached_ && sameTexture && selfTexFlushGen_ == state.texFlushGen) {
+		for (int i = 0; i <= state.maxTexLevel; ++i) {
+			if (!selfTexBuf_[i].empty())
+				selfTexState_.texptr[i] = selfTexBuf_[i].data();
+		}
+		return selfTexState_;
+	}
+	if (cacheSized && !(selfTexCached_ && sameTexture))
+		selfTexValid_ = false;
+	selfTexCached_ = cacheSized;
+	selfTexFlushGen_ = state.texFlushGen;
+
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const u8 *src = state.texptr[i];
+		const uint32_t bytes = state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+		if (!src || !Memory::IsValidRange(state.texaddr[i], bytes))
+			continue;
+		std::vector<u8> &buf = selfTexBuf_[i];
+		if (!selfTexValid_ || selfTexAddr_[i] != state.texaddr[i] || buf.size() != bytes) {
+			buf.assign(src, src + bytes);
+			selfTexAddr_[i] = state.texaddr[i];
+		} else {
+			// Only the rows the previous primitive drew have changed.
+			const DrawingCoords tl = TransformUnit::ScreenToDrawing(selfTexLastRange_.x1, selfTexLastRange_.y1);
+			const DrawingCoords br = TransformUnit::ScreenToDrawing(selfTexLastRange_.x2, selfTexLastRange_.y2);
+			const int64_t rowsStart = (int64_t)(drawTargetAddr_ & mirrorMask) + tl.y * fbStrideBytes;
+			const int64_t rowsEnd = (int64_t)(drawTargetAddr_ & mirrorMask) + (br.y + 1) * fbStrideBytes;
+			const int64_t texStart = state.texaddr[i] & mirrorMask;
+			const int64_t start = std::max(rowsStart, texStart) - texStart;
+			const int64_t end = std::min(rowsEnd, texStart + bytes) - texStart;
+			if (start < end)
+				memcpy(buf.data() + start, src + start, (size_t)(end - start));
+		}
+		selfTexState_.texptr[i] = buf.data();
+	}
+
+	// A depth write could change the texture outside the color rows, so then copy all of it each time.
+	selfTexValid_ = !state.pixelID.depthWrite;
+	selfTexLastRange_ = item.range;
+	return selfTexState_;
+}
+
+bool BinManager::HasTextureWrite(const RasterizerState &state) {
+	if (!state.enableTextures)
+		return false;
+
+	const uint8_t textureBits = textureBitsPerPixel[state.samplerID.texfmt];
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		int byteStride = (state.texbufw[i] * textureBits) / 8;
+		int byteWidth = (state.samplerID.cached.sizes[i].w * textureBits) / 8;
+		int h = state.samplerID.cached.sizes[i].h;
+		if (HasPendingWrite(state.texaddr[i], byteStride, byteWidth, h))
+			return true;
+	}
+
+	return false;
+}
+
+bool BinManager::IsExactSelfRender(const Rasterizer::RasterizerState &state, const BinItem &item) const {
+	if (item.type != BinItemType::SPRITE && item.type != BinItemType::RECT)
+		return false;
+	if (state.textureProj || state.maxTexLevel > 0)
+		return false;
+
+	// Only possible if the texture is 1:1.
+	if ((state.texaddr[0] & 0x0F1FFFFF) != (drawTargetAddr_ & 0x0F1FFFFF))
+		return false;
+	int bufferPixelWidth = BufferFormatBytesPerPixel(state.pixelID.FBFormat());
+	int texturePixelWidth = textureBitsPerPixel[state.samplerID.texfmt] / 8;
+	if (bufferPixelWidth != texturePixelWidth)
+		return false;
+
+	Vec4f tc = Vec4f(item.v0.texturecoords.x, item.v0.texturecoords.y, item.v1.texturecoords.x, item.v1.texturecoords.y);
+	if (state.throughMode) {
+		// Already at texels, convert to screen.
+		tc = tc * SCREEN_SCALE_FACTOR;
+	} else {
+		// Need to also multiply by width/height in transform mode.
+		int w = state.samplerID.cached.sizes[0].w * SCREEN_SCALE_FACTOR;
+		int h = state.samplerID.cached.sizes[0].h * SCREEN_SCALE_FACTOR;
+		tc = tc * Vec4f(w, h, w, h);
+	}
+
+	Vec4<int> tci = tc.Cast<int>();
+	if (tci.x != item.v0.screenpos.x || tci.y != item.v0.screenpos.y)
+		return false;
+	if (tci.z != item.v1.screenpos.x || tci.w != item.v1.screenpos.y)
+		return false;
+
+	return true;
+}
+
+void BinManager::MarkPendingReads(const Rasterizer::RasterizerState &state) {
+	if (!state.enableTextures)
+		return;
+
+	const uint8_t textureBits = textureBitsPerPixel[state.samplerID.texfmt];
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		uint32_t byteStride = (state.texbufw[i] * textureBits) / 8;
+		uint32_t byteWidth = (state.samplerID.cached.sizes[i].w * textureBits) / 8;
+		uint32_t h = state.samplerID.cached.sizes[i].h;
+		auto it = pendingReads_.find(state.texaddr[i]);
+		if (it != pendingReads_.end()) {
+			uint32_t total = byteStride * (h - 1) + byteWidth;
+			uint32_t existing = it->second.strideBytes * (it->second.height - 1) + it->second.widthBytes;
+			if (existing < total) {
+				it->second.strideBytes = std::max(it->second.strideBytes, byteStride);
+				it->second.widthBytes = std::max(it->second.widthBytes, byteWidth);
+				it->second.height = std::max(it->second.height, h);
+			}
+		} else {
+			auto &range = pendingReads_[state.texaddr[i]];
+			range.base = state.texaddr[i];
+			range.strideBytes = byteStride;
+			range.widthBytes = byteWidth;
+			range.height = h;
+		}
+	}
+}
+
+void BinManager::MarkPendingWrites(const Rasterizer::RasterizerState &state) {
+	DrawingCoords scissorTL(gstate.getScissorX1(), gstate.getScissorY1());
+	DrawingCoords scissorBR(std::min(gstate.getScissorX2(), gstate.getRegionX2()), std::min(gstate.getScissorY2(), gstate.getRegionY2()));
+
+	constexpr uint32_t mirrorMask = 0x041FFFFF;
+	const uint32_t bpp = state.pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+	pendingWrites_[0].Expand(gstate.getFrameBufAddress() & mirrorMask, bpp, gstate.FrameBufStride(), scissorTL, scissorBR);
+	if (state.pixelID.depthWrite) {
+		pendingWrites_[1].Expand(gstate.getDepthBufAddress() & mirrorMask, 2, gstate.DepthBufStride(), scissorTL, scissorBR);
+	} else if (gstate.isDepthTestEnabled() && !gstate.isModeClear()) {
+		// Testing without writing still reads the depth buffer, so a transfer into it has to wait.
+		const uint32_t depthAddr = gstate.getDepthBufAddress() & mirrorMask;
+		pendingReads_[depthAddr].Expand(depthAddr, 2, gstate.DepthBufStride(), scissorTL, scissorBR);
+	}
+}
+
+inline void BinDirtyRange::Expand(uint32_t newBase, uint32_t bpp, uint32_t stride, const DrawingCoords &tl, const DrawingCoords &br) {
+	const uint32_t w = br.x - tl.x + 1;
+	const uint32_t h = br.y - tl.y + 1;
+
+	newBase += tl.y * stride * bpp + tl.x * bpp;
+	if (base == 0) {
+		base = newBase;
+		strideBytes = stride * bpp;
+		widthBytes = w * bpp;
+		height = h;
+		return;
+	}
+
+	height = std::max(height, h);
+	if (base == newBase && strideBytes == stride * bpp) {
+		widthBytes = std::max(widthBytes, w * bpp);
+		return;
+	}
+
+	if (stride != 0)
+		height += ((int)base - (int)newBase) / (stride * bpp);
+	base = std::min(base, newBase);
+	strideBytes = std::max(strideBytes, stride * bpp);
+	widthBytes = strideBytes;
+}
+
+void BinManager::UpdateClut(const void *src) {
+	PROFILE_THIS_SCOPE("bin_clut");
+	if (cluts_.Full())
+		Flush("cluts");
+	BinClut &clut = cluts_.PeekPush();
+	memcpy(clut.readable, src, sizeof(BinClut));
+	clutIndex_ = (uint16_t)cluts_.PushPeeked();
+}
+
+void BinManager::AddTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2) {
+	Vec2<int> d01((int)v0.screenpos.x - (int)v1.screenpos.x, (int)v0.screenpos.y - (int)v1.screenpos.y);
+	Vec2<int> d02((int)v0.screenpos.x - (int)v2.screenpos.x, (int)v0.screenpos.y - (int)v2.screenpos.y);
+	Vec2<int> d12((int)v1.screenpos.x - (int)v2.screenpos.x, (int)v1.screenpos.y - (int)v2.screenpos.y);
+
+	// Drop primitives which are not in CCW order by checking the cross product, and ones with zero
+	// area, which light no pixels even on an edge through pixel centers (gpu/probe exp118).
+	static_assert(SCREEN_SCALE_FACTOR <= 16, "Fails if scale factor is too high");
+	// In 64 bits: with vertices far apart in the 4096 pixel space the products overflow 32 (gpu/probe exp132).
+	if ((int64_t)d01.x * d02.y - (int64_t)d01.y * d02.x <= 0)
+		return;
+
+	// Was it fully outside the scissor?
+	const BinCoords range = Range(v0, v1, v2);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Triangle(State(), v0, v1, v2);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::TRIANGLE, stateIndex_, range, v0, v1, v2 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0, v1, v2);
+	Expand(range);
+}
+
+void BinManager::AddClearRect(const VertexData &v0, const VertexData &v1) {
+	const BinCoords range = Range(v0, v1);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Rect(State(), v0, v1, true);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::CLEAR_RECT, stateIndex_, range, v0, v1 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0, v1, true);
+	Expand(range);
+}
+
+void BinManager::AddRect(const VertexData &v0, const VertexData &v1) {
+	const BinCoords range = Range(v0, v1);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Rect(State(), v0, v1, false);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::RECT, stateIndex_, range, v0, v1 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0, v1, true);
+	Expand(range);
+}
+
+void BinManager::AddSprite(const VertexData &v0, const VertexData &v1) {
+	const BinCoords range = Range(v0, v1);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Rect(State(), v0, v1, false);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::SPRITE, stateIndex_, range, v0, v1 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0, v1, true);
+	Expand(range);
+}
+
+void BinManager::AddLine(const VertexData &v0, const VertexData &v1) {
+	const BinCoords range = Range(v0, v1);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Line(State(), v0, v1);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::LINE, stateIndex_, range, v0, v1 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0, v1, false);
+	Expand(range);
+}
+
+void BinManager::AddPoint(const VertexData &v0) {
+	const BinCoords range = Range(v0);
+	if (range.Invalid())
+		return;
+	if (Rasterizer::g_hardwareBackend) {
+		Rasterizer::g_hardwareBackend->Point(State(), v0);
+		return;
+	}
+
+	if (queue_.Full())
+		Drain();
+	queue_.Push(BinItem{ BinItemType::POINT, stateIndex_, range, v0 });
+	CalculateRasterStateFlags(&states_[stateIndex_], v0);
+	Expand(range);
+}
+
+void BinManager::Drain(bool flushing) {
+	PROFILE_THIS_SCOPE("bin_drain");
+
+	// If the waitable has fully drained, we can update our binning decisions.
+	if (!tasksSplit_ || waitable_->Empty()) {
+		int w2 = (queueRange_.x2 - queueRange_.x1 + (SCREEN_SCALE_FACTOR * 2 - 1)) / (SCREEN_SCALE_FACTOR * 2);
+		int h2 = (queueRange_.y2 - queueRange_.y1 + (SCREEN_SCALE_FACTOR * 2 - 1)) / (SCREEN_SCALE_FACTOR * 2);
+
+		// Always bin the entire possible range, but focus on the drawn area.
+		ScreenCoords tl(0, 0, 0);
+		ScreenCoords br(1024 * SCREEN_SCALE_FACTOR, 1024 * SCREEN_SCALE_FACTOR, 0);
+
+		if (pendingOverlap_ && maxTasks_ == 1 && flushing && queue_.Size() == 1 && !FORCE_SINGLE_THREAD) {
+			// If the drawing is 1:1, we can potentially use threads.  It's worth checking.
+			const auto &item = queue_.PeekNext();
+			const auto &state = states_[item.stateIndex];
+			if (IsExactSelfRender(state, item))
+				maxTasks_ = std::min(g_threadManager.GetNumLooperThreads(), MAX_POSSIBLE_TASKS);
+		}
+
+		taskRanges_.clear();
+		if (h2 >= 18 && w2 >= h2 * 4) {
+			int bin_w = std::max(4, (w2 + maxTasks_ - 1) / maxTasks_) * SCREEN_SCALE_FACTOR * 2;
+			taskRanges_.push_back(BinCoords{ tl.x, tl.y, queueRange_.x1 + bin_w - 1, br.y - 1 });
+			for (int x = queueRange_.x1 + bin_w; x <= queueRange_.x2; x += bin_w) {
+				int x2 = x + bin_w > queueRange_.x2 ? br.x : x + bin_w;
+				taskRanges_.push_back(BinCoords{ x, tl.y, x2 - 1, br.y - 1 });
+			}
+		} else if (h2 >= 18 && w2 >= 18) {
+			int bin_h = std::max(4, (h2 + maxTasks_ - 1) / maxTasks_) * SCREEN_SCALE_FACTOR * 2;
+			taskRanges_.push_back(BinCoords{ tl.x, tl.y, br.x - 1, queueRange_.y1 + bin_h - 1 });
+			for (int y = queueRange_.y1 + bin_h; y <= queueRange_.y2; y += bin_h) {
+				int y2 = y + bin_h > queueRange_.y2 ? br.y : y + bin_h;
+				taskRanges_.push_back(BinCoords{ tl.x, y, br.x - 1, y2 - 1 });
+			}
+		}
+
+		tasksSplit_ = true;
+	}
+
+	// Let's try to optimize states, if we can.
+	OptimizePendingStates(pendingStateIndex_, stateIndex_);
+	pendingStateIndex_ = stateIndex_;
+
+	if (taskRanges_.size() <= 1) {
+		PROFILE_THIS_SCOPE("bin_drain_single");
+		// Anything (transfers, the CPU) may have written memory since the last drain.
+		selfTexValid_ = false;
+		while (!queue_.Empty()) {
+			const BinItem &item = queue_.PeekNext();
+			const RasterizerState &state = states_[item.stateIndex];
+			if (state.selfTexture) {
+				DrawBinItem(item, SelfTextureSnapshot(item, state));
+			} else {
+				selfTexValid_ = false;
+				DrawBinItem(item, state);
+			}
+			queue_.SkipNext();
+		}
+	} else {
+		int max = flushing ? QUEUED_PRIMS : QUEUED_PRIMS / 2;
+		while (!queue_.Empty()) {
+			const BinItem &item = queue_.PeekNext();
+			for (int i = 0; i < (int)taskRanges_.size(); ++i) {
+				const BinCoords range = taskRanges_[i].Intersect(item.range);
+				if (range.Invalid())
+					continue;
+
+				if (taskQueues_[i].NearFull()) {
+					// This shouldn't often happen, but if it does, wait for space.
+					if (taskQueues_[i].Full())
+						waitable_->Wait();
+					// If we're not flushing and not near full, let's just continue later.
+					// Near full means we'd drain on next prim, so better to finish it now.
+					else if (!flushing && !queue_.NearFull())
+						max = 0;
+				}
+
+				BinItem &taskItem = taskQueues_[i].PeekPush();
+				taskItem = item;
+				taskItem.range = range;
+				taskQueues_[i].PushPeeked();
+			}
+			queue_.SkipNext();
+			if (--max <= 0)
+				break;
+		}
+
+		int threads = 0;
+		for (int i = 0; i < (int)taskRanges_.size(); ++i) {
+			if (taskQueues_[i].Empty())
+				continue;
+			threads++;
+			if (taskStatus_[i])
+				continue;
+
+			waitable_->Fill();
+			taskStatus_[i] = true;
+			g_threadManager.EnqueueTaskOnThread(i, taskLists_[i].Next());
+			enqueues_++;
+		}
+
+		mostThreads_ = std::max(mostThreads_, threads);
+	}
+}
+
+void BinManager::Flush(const char *reason) {
+	if (Rasterizer::g_hardwareBackend) {
+		// Nothing is ever queued here; let the backend write back what the reason needs, then forget
+		// pending ranges exactly as a real flush does.
+		Rasterizer::g_hardwareBackend->Flush(reason);
+		while (states_.Size() > 1)
+			states_.SkipNext();
+		while (cluts_.Size() > 1)
+			cluts_.SkipNext();
+		for (BinDirtyRange &pending : pendingWrites_)
+			pending.base = 0;
+		pendingOverlap_ = false;
+		pendingReads_.clear();
+		dirty_ |= SoftDirty::BINNER_RANGE | SoftDirty::BINNER_OVERLAP;
+		return;
+	}
+	if (queueRange_.x1 == 0x7FFFFFFF) {
+		// Nothing queued, so nothing refers to the older states and CLUTs. Trim them anyway: callers
+		// flush because one of these rings is full, and push into it right after.
+		while (states_.Size() > 1) {
+			states_.SkipNext();
+		}
+		while (cluts_.Size() > 1) {
+			cluts_.SkipNext();
+		}
+		return;
+	}
+
+	double st = 0.0;
+	const bool collectDebugStats = g_coreCollectDebugStats;
+	if (collectDebugStats) {
+		st = time_now_d();
+	}
+	Drain(true);
+	waitable_->Wait();
+	taskRanges_.clear();
+	tasksSplit_ = false;
+
+	queue_.Reset();
+	while (states_.Size() > 1)
+		states_.SkipNext();
+	while (cluts_.Size() > 1)
+		cluts_.SkipNext();
+
+	Rasterizer::FlushJit();
+	Sampler::FlushJit();
+
+	queueRange_.x1 = 0x7FFFFFFF;
+	queueRange_.y1 = 0x7FFFFFFF;
+	queueRange_.x2 = 0;
+	queueRange_.y2 = 0;
+
+	for (BinDirtyRange &pending : pendingWrites_) {
+		pending.base = 0;
+	}
+	pendingOverlap_ = false;
+	pendingReads_.clear();
+
+	// We'll need to set the pending writes and reads again, since we just flushed it.
+	dirty_ |= SoftDirty::BINNER_RANGE | SoftDirty::BINNER_OVERLAP;
+
+	if (collectDebugStats) {
+		const double et = time_now_d();
+		flushReasonTimes_[reason] += et - st;
+		if (et - st > slowestFlushTime_) {
+			slowestFlushTime_ = et - st;
+			slowestFlushReason_ = reason;
+		}
+	}
+}
+
+void BinManager::OptimizePendingStates(uint16_t first, uint16_t last) {
+	// We can sometimes hit this when compiling new funcs while creating a state.
+	// At that point, the state isn't loaded fully yet, so don't touch it.
+	if (creatingState_ && last == stateIndex_) {
+		if (first == last)
+			return;
+		last--;
+	}
+
+	const int count = (QUEUED_STATES + last - first) % QUEUED_STATES + 1;
+	for (int i = 0; i < count; ++i) {
+		size_t pos = (first + i) % QUEUED_STATES;
+		OptimizeRasterState(&states_[pos]);
+	}
+}
+
+bool BinManager::HasPendingWrite(uint32_t start, uint32_t stride, uint32_t w, uint32_t h) {
+	if (Rasterizer::g_hardwareBackend)
+		return Rasterizer::g_hardwareBackend->HasPendingWrite(start, stride, w, h);
+	// We can only write to VRAM.
+	if (!Memory::IsVRAMAddress(start))
+		return false;
+	// Ignore mirrors for overlap detection.
+	start &= 0x041FFFFF;
+
+	uint32_t size = stride * (h - 1) + w;
+	for (const auto &range : pendingWrites_) {
+		if (range.base == 0 || range.strideBytes == 0)
+			continue;
+		if (start >= range.base + range.height * range.strideBytes || start + size <= range.base)
+			continue;
+
+		// Let's simply go through each line.  Might be in the stride gap.
+		uint32_t row = start;
+		for (uint32_t y = 0; y < h; ++y) {
+			int32_t offset = row - range.base;
+			int32_t rangeY = offset / (int32_t)range.strideBytes;
+			uint32_t rangeX = offset % (int32_t)range.strideBytes;
+			if (rangeY >= 0 && (uint32_t)rangeY < range.height) {
+				// If this row is either within width, or extends beyond stride, overlap.
+				if (rangeX < range.widthBytes || rangeX + w >= range.strideBytes)
+					return true;
+			}
+
+			row += stride;
+		}
+	}
+
+	return false;
+}
+
+bool BinManager::HasPendingRead(uint32_t start, uint32_t stride, uint32_t w, uint32_t h) {
+	// The hardware backend copies textures when drawing (on the GE worker, if there is one, so
+	// finish that first).
+	if (Rasterizer::g_hardwareBackend) {
+		if (Rasterizer::g_hardwareBackend->MayRead(start, stride, w, h))
+			Rasterizer::g_hardwareBackend->Sync();
+		return false;
+	}
+	if (Memory::IsVRAMAddress(start)) {
+		// Ignore VRAM mirrors.
+		start &= 0x041FFFFF;
+	} else {
+		// Ignore only regular RAM mirrors.
+		start &= 0x3FFFFFFF;
+	}
+
+	uint32_t size = stride * (h - 1) + w;
+	for (const auto &pair : pendingReads_) {
+		const auto &range = pair.second;
+		if (start >= range.base + range.height * range.strideBytes || start + size <= range.base)
+			continue;
+
+		// Stride gaps are uncommon with reads, so don't bother.
+		return true;
+	}
+
+	return false;
+}
+
+void BinManager::GetStats(StringWriter &w) {
+	double allTotal = 0.0;
+	double slowestTotalTime = 0.0;
+	const char *slowestTotalReason = nullptr;
+	for (auto &it : flushReasonTimes_) {
+		if (it.second > slowestTotalTime) {
+			slowestTotalTime = it.second;
+			slowestTotalReason = it.first;
+		}
+		allTotal += it.second;
+	}
+
+	// Many games are 30 FPS, so check last frame too for better stats.
+	double recentTotal = allTotal;
+	double slowestRecentTime = slowestTotalTime;
+	const char *slowestRecentReason = slowestTotalReason;
+	for (auto &it : lastFlushReasonTimes_) {
+		if (it.second > slowestRecentTime) {
+			slowestRecentTime = it.second;
+			slowestRecentReason = it.first;
+		}
+		recentTotal += it.second;
+	}
+	w.F("Slowest individual flush: %s (%0.4f)\n"
+		"Slowest frame flush: %s (%0.4f)\n"
+		"Slowest recent flush: %s (%0.4f)\n"
+		"Total flush time: %0.4f (%05.2f%%, last 2: %05.2f%%)\n"
+		"Thread enqueues: %d, count %d",
+		slowestFlushReason_, slowestFlushTime_,
+		slowestTotalReason, slowestTotalTime,
+		slowestRecentReason, slowestRecentTime,
+		allTotal, allTotal * (6000.0 / 1.001), recentTotal * (3000.0 / 1.001),
+		enqueues_, mostThreads_);
+}
+
+void BinManager::ResetStats() {
+	lastFlushReasonTimes_ = std::move(flushReasonTimes_);
+	flushReasonTimes_.clear();
+	slowestFlushReason_ = nullptr;
+	slowestFlushTime_ = 0.0;
+	enqueues_ = 0;
+	mostThreads_ = 0;
+}
+
+inline BinCoords BinCoords::Intersect(const BinCoords &range) const {
+	BinCoords sub;
+	sub.x1 = std::max(x1, range.x1);
+	sub.y1 = std::max(y1, range.y1);
+	sub.x2 = std::min(x2, range.x2);
+	sub.y2 = std::min(y2, range.y2);
+	return sub;
+}
+
+BinCoords BinManager::Scissor(BinCoords range) {
+	return range.Intersect(scissor_);
+}
+
+BinCoords BinManager::Range(const VertexData &v0, const VertexData &v1, const VertexData &v2) {
+	BinCoords range;
+	range.x1 = std::min(std::min(v0.screenpos.x, v1.screenpos.x), v2.screenpos.x) & ~(SCREEN_SCALE_FACTOR - 1);
+	range.y1 = std::min(std::min(v0.screenpos.y, v1.screenpos.y), v2.screenpos.y) & ~(SCREEN_SCALE_FACTOR - 1);
+	range.x2 = std::max(std::max(v0.screenpos.x, v1.screenpos.x), v2.screenpos.x) | (SCREEN_SCALE_FACTOR - 1);
+	range.y2 = std::max(std::max(v0.screenpos.y, v1.screenpos.y), v2.screenpos.y) | (SCREEN_SCALE_FACTOR - 1);
+	return Scissor(range);
+}
+
+BinCoords BinManager::Range(const VertexData &v0, const VertexData &v1) {
+	BinCoords range;
+	range.x1 = std::min(v0.screenpos.x, v1.screenpos.x) & ~(SCREEN_SCALE_FACTOR - 1);
+	range.y1 = std::min(v0.screenpos.y, v1.screenpos.y) & ~(SCREEN_SCALE_FACTOR - 1);
+	range.x2 = std::max(v0.screenpos.x, v1.screenpos.x) | (SCREEN_SCALE_FACTOR - 1);
+	range.y2 = std::max(v0.screenpos.y, v1.screenpos.y) | (SCREEN_SCALE_FACTOR - 1);
+	return Scissor(range);
+}
+
+BinCoords BinManager::Range(const VertexData &v0) {
+	BinCoords range;
+	range.x1 = v0.screenpos.x & ~(SCREEN_SCALE_FACTOR - 1);
+	range.y1 = v0.screenpos.y & ~(SCREEN_SCALE_FACTOR - 1);
+	range.x2 = v0.screenpos.x | (SCREEN_SCALE_FACTOR - 1);
+	range.y2 = v0.screenpos.y | (SCREEN_SCALE_FACTOR - 1);
+	return Scissor(range);
+}
+
+void BinManager::Expand(const BinCoords &range) {
+	queueRange_.x1 = std::min(queueRange_.x1, range.x1);
+	queueRange_.y1 = std::min(queueRange_.y1, range.y1);
+	queueRange_.x2 = std::max(queueRange_.x2, range.x2);
+	queueRange_.y2 = std::max(queueRange_.y2, range.y2);
+
+	if (maxTasks_ == 1 || (queueRange_.y2 - queueRange_.y1 >= 224 * SCREEN_SCALE_FACTOR && enqueues_ < 36 * maxTasks_)) {
+		if (pendingOverlap_)
+			Flush("expand");
+		else
+			Drain();
+	}
+}

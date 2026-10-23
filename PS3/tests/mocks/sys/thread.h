@@ -1,0 +1,2 @@
+#pragma once
+int sysThreadYield();
