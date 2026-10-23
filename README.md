@@ -4,10 +4,28 @@ A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
 
-This is an early, experimental release. Many games start and some run well, but some are still
-slow (heavy 3D games such as Midnight Club: L.A. Remix can drop to 10-15 fps), and some have
-graphics or sound glitches. Every game is different, so most settings can be changed per game (see
+# Notes from the author
+
+The games confirmed working are:
+
+| Game | Notes |
+| --- | --- |
+| 3rd Birthday | No issues, 30 FPS. |
+| Silent Hill Origins | No issues, 30 FPS. |
+| Dead to Rights Retribution | No issues, 30 FPS. |
+| Call of Duty Road to Victory | No issues, 20–30 FPS. |
+| Killzone | Mostly around 30 FPS. The first cutscene is slightly glitchy at the very beginning. |
+| Def Jam Fight for NY: Takeover | Confirmed working; no additional notes. |
+| Midnight Club LA | Runs slowly at 10–15 FPS. Some minor texture issues. |
+
+Every game is different, so most settings can be changed per game (see
 [Per-game settings](#per-game-settings)).
+
+Interface is mostly self-explanatory. Pressing Start+Select together will open an in-game menu to change some settings or quit into the game list.
+You can also load configs or edit them yourself. There are many options, I have uploaded best configs for those specific games I have tested. 
+However you may find other setting combinations better. Configs must be named according to the game's ISO file (but with INI extension) and placed into the app's "Games" folder.
+Keep in mind that config files override global options.
+
 
 ## Contents
 
