@@ -8,7 +8,7 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 - **Online functionality**
 - **CheatCodes functionality**
 - **Save States (regular memory saving works)**
-- **Whatever else fancy feature that PC version had that is not performance-related**
+- **Whatever else fancy feature the PC version had that is not performance-related**
 
 [![Watch the gameplay showcase](https://img.youtube.com/vi/Jf_ADUqxCiI/hqdefault.jpg)](https://youtu.be/Jf_ADUqxCiI)
 
