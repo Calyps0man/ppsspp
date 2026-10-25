@@ -6,7 +6,11 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 
 ### **25.10.2026 UPDATE - Experimental version 0.2**
 - **Focused on improving performance for Spider-Man 3 and MGS: Portable OPS**
+- **Faster GE list modes. Also a faster CPU JIT (instruction scheduling for the PS3's CPU) and faster curved
+surfaces at Curve quality Low and Medium.**
 - **Experimental build means it may have issues. It also COULD break other games that used to work before. So keep that in mind**
+
+
 
 ### **WARNING: This version of the emulator DOES NOT have:**
 - **Online functionality**
