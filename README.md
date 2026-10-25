@@ -10,6 +10,8 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 surfaces at Curve quality Low and Medium.**
 - **Experimental build means it may have issues. It also COULD break other games that used to work before. So keep that in mind**
 
+[![Watch here](https://img.youtube.com/vi/1GnP0CGedl0/hqdefault.jpg)](https://youtu.be/1GnP0CGedl0)
+
 
 
 ### **WARNING: This version of the emulator DOES NOT have:**
