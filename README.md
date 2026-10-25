@@ -1,8 +1,12 @@
-# PPSSPP PS3, ver 0.1 (build 270)
+# PPSSPP for PS3
 
 A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3, built with the
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
+
+### **25.10.2026 UPDATE - Experimental version 0.2**
+- **Focused on improving performance for Spider-Man 3 and MGS: Portable OPS**
+- **Experimental build means it may have issues. It also COULD break other games that used to work before. So keep that in mind**
 
 ### **WARNING: This version of the emulator DOES NOT have:**
 - **Online functionality**
