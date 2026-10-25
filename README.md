@@ -4,6 +4,18 @@ A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
 
+[![Watch the gameplay showcase](https://img.youtube.com/vi/Jf_ADUqxCiI/hqdefault.jpg)](https://youtu.be/Jf_ADUqxCiI)
+
+### **WARNING: !!! IT DOES NOT RUN EVERY SINGLE PSP GAME !!! THIS IS JUST A PROOF OF CONCEPT TO TEST AI'S CAPABILITIES !!! **
+### **WARNING: I AM NOT GOING TO DEVELOP IT ANY FURTHER. I AM NOT GOING TO TROUBLESHOOT EVERY ISSUE YOU MAY HAVE AND I DO NOT TAKE REQUESTS. I HAVE SHARED EVERYTHING HERE SO THAT COMMUNITY CAN CONTINUE THIS PROJECT IF NECESSARY.**
+
+
+### **ANOTHER WARNING: This version of the emulator DOES NOT have:**
+- **Online functionality**
+- **CheatCodes functionality**
+- **Save States (regular memory saving works)**
+- **Whatever else fancy feature the PC version had that is not performance-related**
+
 ### **25.10.2026 UPDATE - Experimental version 0.2**
 - **Focused on improving performance for Spider-Man 3 and MGS: Portable OPS**
 - **Faster GE list modes. Also a faster CPU JIT (instruction scheduling for the PS3's CPU) and faster curved
@@ -13,14 +25,6 @@ surfaces at Curve quality Low and Medium.**
 [![Watch here](https://img.youtube.com/vi/1GnP0CGedl0/hqdefault.jpg)](https://youtu.be/1GnP0CGedl0)
 
 
-
-### **WARNING: This version of the emulator DOES NOT have:**
-- **Online functionality**
-- **CheatCodes functionality**
-- **Save States (regular memory saving works)**
-- **Whatever else fancy feature the PC version had that is not performance-related**
-
-[![Watch the gameplay showcase](https://img.youtube.com/vi/Jf_ADUqxCiI/hqdefault.jpg)](https://youtu.be/Jf_ADUqxCiI)
 
 # Notes from the author
 
