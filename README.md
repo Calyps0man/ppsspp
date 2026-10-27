@@ -15,11 +15,11 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 - **Save States (regular memory saving works)**
 - **Whatever else fancy feature the PC version had that is not performance-related**
 
-### **27.10.2026 UPDATE**
+### **27.10.2026 UPDATE - Experimental version 0.2 (build 300).**
 
-- **Added config for Spider-Man 2**
+- **Fixed intro freeze for Spider-Man 2 due to unsupported audio codec. It  can now play intro videos. Use config if necessary to run the game at stable 30 fps. Otherwise it is the same as build 299**
 
-### **25.10.2026 UPDATE - Experimental version 0.2**
+### **25.10.2026 UPDATE - Experimental version 0.2 (build 299)**
 - **Focused on improving performance for Spider-Man 3 and MGS: Portable OPS**
 - **Faster GE list modes. Also a faster CPU JIT (instruction scheduling for the PS3's CPU) and faster curved
 surfaces at Curve quality Low and Medium.**
