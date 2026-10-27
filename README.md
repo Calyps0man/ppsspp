@@ -15,6 +15,10 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 - **Save States (regular memory saving works)**
 - **Whatever else fancy feature the PC version had that is not performance-related**
 
+### **27.10.2026 UPDATE**
+
+- **Added config for Spider-Man 2**
+
 ### **25.10.2026 UPDATE - Experimental version 0.2**
 - **Focused on improving performance for Spider-Man 3 and MGS: Portable OPS**
 - **Faster GE list modes. Also a faster CPU JIT (instruction scheduling for the PS3's CPU) and faster curved
