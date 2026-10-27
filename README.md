@@ -1,6 +1,6 @@
 # PPSSPP for PS3
 
-A port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3, built with the
+An UNOFFICIAL port of the [PPSSPP](https://www.ppsspp.org) PSP emulator to the PlayStation 3, built with the
 open-source PSL1GHT SDK. It runs PSP games from the PS3's hard drive, with a JIT for the PSP's CPU
 and a graphics renderer that draws on the PS3's RSX graphics chip.
 
