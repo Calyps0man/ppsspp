@@ -8,12 +8,15 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 
 ### **WARNING: !!! IT DOES NOT RUN EVERY SINGLE PSP GAME !!! THE GAMES THAT DO WORK ARE SHOWN IN THE VIDEOS, I HAVE NOT TESTED ANYTHING ELSE, SO I DON'T KNOW IF "XYZ" GAME WORKS. STOP ASKING ME THAT. EACH GAME IS DIFFERENT AND NEEDS APPROXIMATELY 50 DEBUGGING TESTS TO BECOME PLAYABLE. THAT IS HOURS AND DAYS OF WORK THAT I DO NOT HAVE TIME FOR. TRY TO UNDERSTAND THAT!!! THIS WAS JUST A PROOF OF CONCEPT TO TEST AI'S CAPABILITIES !!!  I AM NOT GOING TO DEVELOP IT ANY FURTHER. I AM NOT GOING TO TROUBLESHOOT EVERY ISSUE YOU MAY HAVE AND I DO NOT TAKE REQUESTS. I HAVE SHARED EVERYTHING HERE SO THAT COMMUNITY CAN CONTINUE THIS PROJECT IF NECESSARY.**
 
-
 ### **ANOTHER WARNING: This version of the emulator DOES NOT have:**
 - **Online functionality**
 - **CheatCodes functionality**
-- **Save States (regular memory saving works)**
 - **Whatever else fancy feature the PC version had that is not performance-related**
+
+###  **28.10.2026 UPDATE - Experimental version 0.2 (build 310).**
+
+- **Save states. You can now save game at any point like in PC version of the emulator. Saving is done through in-game menu by pressing Select + Start and choosing a slot to save or load**
+- **Apparently Spider-Man 3 still kept freezing later in the game. This should be fixed now. New config attached. Also more performance optimization was done, so it should run a tiny bit better. Resolution had to be dropped to 1x. It is a demanding game...**
 
 ### **27.10.2026 UPDATE - Experimental version 0.2 (build 301).**
 
