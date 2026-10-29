@@ -13,6 +13,10 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 - **CheatCodes functionality**
 - **Whatever else fancy feature the PC version had that is not performance-related**
 
+- ###  29.10.26 UPDATE
+
+- **Final fix for Spider-Man 3. Sometimes speed dropped down to 60 % because 30 fps frame cap was never active. It should be fixed now.**
+
 ###  **28.10.2026 UPDATE - Experimental version 0.2 (build 310).**
 
 - **Save states. You can now save game at any point like in PC version of the emulator. Saving is done through in-game menu by pressing Select + Start and choosing a slot to save or load**
