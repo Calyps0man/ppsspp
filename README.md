@@ -13,7 +13,7 @@ and a graphics renderer that draws on the PS3's RSX graphics chip.
 - **CheatCodes functionality**
 - **Whatever else fancy feature the PC version had that is not performance-related**
 
-###  **29.10.26  UPDATE - Experimental version 0.2 (build 313)**
+###  **29.10.2026  UPDATE - Experimental version 0.2 (build 313)**
 
 - **Final fix for Spider-Man 3. Sometimes speed dropped down to 60 % because 30 fps frame cap was never active. It should be fixed now.**
 
